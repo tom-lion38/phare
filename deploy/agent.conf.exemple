@@ -1,0 +1,49 @@
+# Réglages de Phare côté hôte Proxmox : /etc/phare/agent.conf
+# Lu par phare-agent, modele-ct et deploy/installer.sh. Format shell : CLE="valeur", sans espace autour du =.
+# Toutes les valeurs ci-dessous sont des exemples : adapte-les à ton réseau.
+
+# --- Hôte Proxmox
+NOEUD="pve"                      # nom du nœud (pvesh get /nodes)
+HOTE_IP="192.168.10.2"           # IP de l'hôte, vue depuis le CT de Phare
+STOCKAGE="local-lvm"             # stockage des disques des nouveaux CT
+GABARIT="local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst"   # voir : pveam list local
+PONT="vmbr0"
+
+# --- Réseau des CT
+RESEAU="192.168.10"              # les trois premiers octets
+MASQUE="24"
+PASSERELLE="192.168.10.1"
+DNS="192.168.10.3"               # DNS donné aux nouveaux CT (Pi-hole ou routeur)
+DNS_IPS="192.168.10.3 192.168.10.1"   # serveurs DNS que les sites ont le droit de joindre
+DOMAINE_LOCAL="lan"
+FUSEAU="Europe/Paris"
+BLOC_SITES="120-169"               # nouveaux sites : 192.168.10.120 à 192.168.10.169
+BLOC_APPLIS="170-189"              # rangés dans « Applis » dans l'interface
+ID_MIN="110"                     # premier numéro proposé pour un nouveau CT
+
+# --- CT de l'infrastructure
+CT_CADDY="101"
+CADDY_IP="192.168.10.4"
+CADDYFILE="/etc/caddy/Caddyfile"
+# VALIDER_CADDY="runuser -u caddy -- caddy validate --adapter caddyfile --config"
+CT_PIHOLE="100"                  # vide si tu n'as pas de Pi-hole
+CT_TRAFIC=""                     # CT qui garde les résumés GoAccess, vide sinon
+TRAFIC_RESUMES="/var/lib/trafic/resumes"
+CT_PHARE="103"
+IP_PHARE="192.168.10.5"
+CT_PROTEGES="100,101,102,103"    # jamais pilotés par Phare (les CT ci-dessus sont ajoutés d'office)
+
+# --- Sauvegarde
+JOB_SAUVEGARDE=""                # identifiant d'une tâche de sauvegarde (pvesh get /cluster/backup), vide sinon
+
+# --- Accès à l'interface (pas de mot de passe : réseau local et VPN seulement)
+RESEAUX_WEB="192.168.10.0/24, 10.8.0.0/24"
+RESEAUX_SSH="192.168.10.0/24"
+IP_PUBLIQUE=""                   # IP publique de ta box, pour vérifier le DNS des nouveaux domaines
+DOMAINE_EXEMPLE="exemple.fr"     # affiché en exemple dans les formulaires
+
+# --- Modèle commun des CT de sites (modele-ct), facultatif
+ADMIN_IPS=""                     # postes qui peuvent joindre directement le port des sites
+INFLUX=""                        # ip:port d'InfluxDB si Telegraf tourne dans les CT
+LOKI=""                          # ip:port d'un collecteur de journaux en syslog TCP
+JOURNAUX_ENVOI=""                # script appelé avec le numéro du CT pour brancher ses journaux

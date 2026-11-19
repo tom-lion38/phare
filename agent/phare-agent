@@ -1,0 +1,821 @@
+#!/usr/bin/python3
+"""phare-agent : la seule porte de Phare vers l'hôte Proxmox.
+
+Appelé par SSH avec une clé à commande forcée, dans /root/.ssh/authorized_keys de l'hôte :
+    command="/usr/local/sbin/phare-agent",from="<IP du CT de Phare>",restrict ssh-ed25519 ...
+La commande demandée arrive dans SSH_ORIGINAL_COMMAND : « verbe arg1 arg2 ».
+Seuls les verbes de VERBES existent, chaque argument est vérifié, rien n'est passé
+à un shell. Aucun verbe ne supprime de CT ni de données.
+Réponse : du JSON sur la sortie standard ({"ok": true, ...} ou {"ok": false, "erreur": ...}).
+Réglages : /etc/phare/agent.conf (voir deploy/agent.conf.exemple).
+Journal de chaque appel : /var/log/phare-agent.log
+"""
+
+import datetime
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+import uuid
+
+# --------------------------------------------------------------------------- réglages
+
+CONF = os.environ.get("PHARE_AGENT_CONF", "/etc/phare/agent.conf")
+
+
+def lire_conf(chemin):
+    """Lit un fichier CLE="valeur" (même format que le shell, sans substitution de variables)."""
+    conf = {}
+    try:
+        with open(chemin, encoding="utf-8") as f:
+            lignes = f.read().splitlines()
+    except OSError:
+        return conf
+    for ligne in lignes:
+        ligne = ligne.strip()
+        if not ligne or ligne.startswith("#") or "=" not in ligne:
+            continue
+        cle, valeur = ligne.split("=", 1)
+        cle, valeur = cle.strip(), valeur.strip()
+        if valeur[:1] in ("'", '"'):
+            fin = valeur.find(valeur[0], 1)
+            valeur = valeur[1:fin] if fin > 0 else valeur[1:]
+        else:
+            valeur = valeur.split(" #", 1)[0].strip()
+        if re.match(r"^[A-Z_][A-Z0-9_]*$", cle):
+            conf[cle] = valeur
+    return conf
+
+
+def liste(texte):
+    return [x for x in re.split(r"[,\s]+", texte or "") if x]
+
+
+def bloc(texte, defaut):
+    m = re.match(r"^\s*(\d{1,3})\s*-\s*(\d{1,3})\s*$", texte or "")
+    return (int(m.group(1)), int(m.group(2))) if m else defaut
+
+
+_C = lire_conf(CONF)
+
+
+def reglage(cle, defaut=""):
+    return _C.get(cle, defaut)
+
+
+NOEUD = reglage("NOEUD", "pve")
+RESEAU = reglage("RESEAU", "192.168.10")           # les trois premiers octets du réseau des CT
+MASQUE = reglage("MASQUE", "24")
+PASSERELLE = reglage("PASSERELLE", RESEAU + ".1")
+DNS = reglage("DNS", PASSERELLE)                    # serveur DNS donné aux nouveaux CT
+DOMAINE_LOCAL = reglage("DOMAINE_LOCAL", "lan")
+FUSEAU = reglage("FUSEAU", "Europe/Paris")
+PONT = reglage("PONT", "vmbr0")
+STOCKAGE = reglage("STOCKAGE", "local-lvm")
+GABARIT = reglage("GABARIT", "local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst")
+CT_CADDY = reglage("CT_CADDY", "101")
+CT_PIHOLE = reglage("CT_PIHOLE", "")                # vide : pas de Pi-hole
+CT_TRAFIC = reglage("CT_TRAFIC", "")                # vide : pas de statistiques
+CT_PHARE = reglage("CT_PHARE", "103")
+CADDYFILE = reglage("CADDYFILE", "/etc/caddy/Caddyfile")
+VALIDER_CADDY = reglage("VALIDER_CADDY", "runuser -u caddy -- caddy validate --adapter caddyfile --config")
+TRAFIC_RESUMES = reglage("TRAFIC_RESUMES", "/var/lib/trafic/resumes")
+JOB_SAUVEGARDE = reglage("JOB_SAUVEGARDE", "")      # identifiant d'une tâche de sauvegarde Proxmox, vide : aucune
+BLOC_SITES = bloc(reglage("BLOC_SITES"), (120, 169))  # dernier octet des IP des sites
+BLOC_APPLIS = bloc(reglage("BLOC_APPLIS"), (170, 189))
+ID_MIN = int(reglage("ID_MIN", "110") or 110)       # premier numéro proposé pour un nouveau CT
+MODELE_CT = reglage("MODELE_CT", "/usr/local/sbin/modele-ct")
+DOSSIER_JOBS = reglage("DOSSIER_JOBS", "/var/lib/phare-agent/jobs")
+JOURNAL = reglage("JOURNAL", "/var/log/phare-agent.log")
+MAX_ENVOI = 300 * 1024 * 1024
+
+# CT qu'on ne pilote jamais depuis Phare : ceux de la liste, plus l'infra que Phare utilise.
+CT_PROTEGES = set(liste(reglage("CT_PROTEGES", "100,101,102,103"))) | {c for c in (CT_CADDY, CT_PIHOLE, CT_TRAFIC, CT_PHARE) if c}
+UNITES_INTERDITES = re.compile(r"^(ssh|sshd|systemd-.*|dbus|networking|cron|getty@.*|console-.*|nftables|postfix)\.service$")
+
+ID_RE = re.compile(r"^[1-9]\d{2,8}$")
+UNITE_RE = re.compile(r"^[A-Za-z0-9@._-]{1,80}\.service$")
+NOM_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,40}[a-z0-9])?$")
+IP_RE = re.compile(r"^" + re.escape(RESEAU) + r"\.(\d{1,3})$")
+SNAP_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{1,39}$")
+JOB_RE = re.compile(r"^[0-9a-f]{12}$")
+
+PRESETS = {
+    "petit": {"cores": 1, "memory": 512, "swap": 256, "disk": 4},
+    "moyen": {"cores": 2, "memory": 1024, "swap": 512, "disk": 8},
+    "grand": {"cores": 4, "memory": 4096, "swap": 1024, "disk": 16},
+}
+TYPES = ("statique", "node", "next")
+
+
+class Refus(Exception):
+    pass
+
+
+# --------------------------------------------------------------------------- outils
+
+def journal(texte):
+    try:
+        with open(JOURNAL, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.datetime.now().isoformat(timespec='seconds')} {texte}\n")
+    except OSError:
+        pass
+
+
+def lancer(args, entree=None, delai=120, verifier=True):
+    r = subprocess.run(args, input=entree, capture_output=True, timeout=delai)
+    if verifier and r.returncode != 0:
+        msg = (r.stderr or r.stdout).decode("utf-8", "replace").strip().splitlines()
+        raise Refus((msg[-1] if msg else f"échec de {args[0]}")[:400])
+    return r.stdout.decode("utf-8", "replace")
+
+
+def pvesh(*chemin, methode="get", **params):
+    args = ["pvesh", methode, "/" + "/".join(chemin), "--output-format", "json"]
+    for k, v in params.items():
+        args += [f"--{k}", str(v)]
+    sortie = lancer(args, delai=60)
+    return json.loads(sortie) if sortie.strip() else None
+
+
+def ct_existe(ctid):
+    return os.path.exists(f"/etc/pve/lxc/{ctid}.conf")
+
+
+def verifier_ct(ctid, pilotable=True):
+    if not ID_RE.match(ctid or "") or not ct_existe(ctid):
+        raise Refus("CT inconnu.")
+    if pilotable and ctid in CT_PROTEGES:
+        raise Refus("Ce CT fait partie de l'infrastructure : Phare ne le pilote pas.")
+    return ctid
+
+
+def dans_ct(ctid, script, delai=60, entree=None):
+    """Exécute un script sh fixe dans le CT (le texte du script vient de cet agent, jamais de Phare)."""
+    return lancer(["pct", "exec", ctid, "--", "sh", "-c", script], entree=entree, delai=delai)
+
+
+def lire_entree(maxi=MAX_ENVOI):
+    data = sys.stdin.buffer.read(maxi + 1)
+    if len(data) > maxi:
+        raise Refus("Envoi trop gros.")
+    return data
+
+
+def config_ct(ctid):
+    conf = {}
+    with open(f"/etc/pve/lxc/{ctid}.conf", encoding="utf-8") as f:
+        for ligne in f:
+            ligne = ligne.rstrip("\n")
+            if ligne.startswith("["):
+                break  # sections de snapshots
+            if ":" in ligne and not ligne.startswith("#"):
+                k, v = ligne.split(":", 1)
+                conf[k.strip()] = v.strip()
+    return conf
+
+
+def ip_de(conf):
+    m = re.search(r"ip=([0-9.]+)/", conf.get("net0", ""))
+    return m.group(1) if m else None
+
+
+def prochaine_ip_libre(ips):
+    """IP suivante dans le bloc des sites, après la plus haute déjà prise (pas un trou au hasard)."""
+    occupees = {int(IP_RE.match(ip).group(1)) for ip in ips if IP_RE.match(ip)}
+    haut = max([n for n in occupees if BLOC_SITES[0] <= n <= BLOC_SITES[1]] or [BLOC_SITES[0] - 1])
+    for n in range(haut + 1, BLOC_SITES[1] + 1):
+        if n not in occupees:
+            return f"{RESEAU}.{n}"
+    return None
+
+
+def ids_sauvegardes(ids_tous):
+    """Invités couverts par la tâche de sauvegarde JOB_SAUVEGARDE (liste fixe ou « tous sauf »)."""
+    if not JOB_SAUVEGARDE:
+        return []
+    job = next((j for j in pvesh("cluster", "backup") if j.get("id") == JOB_SAUVEGARDE), None)
+    if not job:
+        return []
+    if job.get("all"):
+        exclus = set(liste(str(job.get("exclude", ""))))
+        return [i for i in ids_tous if i not in exclus]
+    return liste(str(job.get("vmid", "")))
+
+
+# --------------------------------------------------------------------------- lecture
+
+def v_etat(_):
+    """Tous les CT/VM, ressources du nœud, IP prises, prochain ID/IP libres pour un site."""
+    ressources = pvesh("cluster", "resources", type="vm")
+    noeud = pvesh("nodes", NOEUD, "status")
+    invites, ips = [], set()
+    for r in ressources:
+        ctid = str(r.get("vmid"))
+        info = {
+            "id": ctid, "type": r.get("type"), "nom": r.get("name"), "etat": r.get("status"),
+            "cpu": r.get("cpu"), "cpus": r.get("maxcpu"), "mem": r.get("mem"), "maxmem": r.get("maxmem"),
+            "disque": r.get("disk"), "maxdisque": r.get("maxdisk"), "uptime": r.get("uptime"),
+            "tags": r.get("tags", ""), "protege": ctid in CT_PROTEGES,
+        }
+        if r.get("type") == "lxc" and ct_existe(ctid):
+            conf = config_ct(ctid)
+            info["ip"] = ip_de(conf)
+            info["onboot"] = conf.get("onboot") == "1"
+            info["description"] = conf.get("description", "")[:300]
+            if info["ip"]:
+                ips.add(info["ip"])
+        invites.append(info)
+    ids = {int(i["id"]) for i in invites}
+    prochain_id = next(n for n in range(max(ID_MIN, 100), 1000000) if n not in ids)
+    return {
+        "invites": sorted(invites, key=lambda i: int(i["id"])),
+        "noeud": {
+            "cpu": noeud.get("cpu"), "cpus": noeud.get("cpuinfo", {}).get("cpus"),
+            "mem": noeud.get("memory", {}).get("used"), "maxmem": noeud.get("memory", {}).get("total"),
+            "uptime": noeud.get("uptime"), "charge": noeud.get("loadavg"),
+        },
+        "prochain_id": str(prochain_id), "prochaine_ip": prochaine_ip_libre(ips),
+        "sauvegarde": ids_sauvegardes([i["id"] for i in invites]),
+        "presets": PRESETS, "types": TYPES,
+        "reseau": {"prefixe": RESEAU, "sites": list(BLOC_SITES), "applis": list(BLOC_APPLIS)},
+        "hote": {"noeud": NOEUD, "ct_caddy": CT_CADDY, "domaine_local": DOMAINE_LOCAL,
+                 "pihole": bool(CT_PIHOLE), "trafic": bool(CT_TRAFIC), "sauvegarde": bool(JOB_SAUVEGARDE)},
+    }
+
+
+SCRIPT_SERVICES = r"""
+ss -ltnpH 2>/dev/null | while read -r etat rq sq local pair proc; do
+  port=${local##*:}
+  pid=$(echo "$proc" | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
+  nomp=$(echo "$proc" | sed -n 's/.*(("\([^"]*\)".*/\1/p')
+  unite=""
+  [ -n "$pid" ] && unite=$(sed -n 's#^0::.*/\([^/]*\.service\).*#\1#p' /proc/$pid/cgroup 2>/dev/null | head -1)
+  case "$local" in 127.*|\[::1\]*) continue;; esac
+  echo "$port|$nomp|$unite"
+done | sort -u
+echo "--unites--"
+systemctl list-units --type=service --state=running,failed,inactive --all --no-legend --plain 2>/dev/null | awk '{print $1"|"$3"|"$4}'
+"""
+
+
+def v_services(args):
+    ctid = verifier_ct(args[0] if args else "", pilotable=False)
+    if pvesh("nodes", NOEUD, "lxc", ctid, "status", "current").get("status") != "running":
+        return {"ecoute": [], "unites": {}, "eteint": True}
+    sortie = dans_ct(ctid, SCRIPT_SERVICES, delai=20)
+    ecoute, unites, partie = [], {}, 0
+    for ligne in sortie.splitlines():
+        if ligne == "--unites--":
+            partie = 1
+            continue
+        morceaux = ligne.split("|")
+        if partie == 0 and len(morceaux) == 3 and morceaux[0].isdigit():
+            ecoute.append({"port": int(morceaux[0]), "processus": morceaux[1], "unite": morceaux[2]})
+        elif partie == 1 and len(morceaux) == 3 and UNITE_RE.match(morceaux[0]):
+            unites[morceaux[0]] = morceaux[1] if morceaux[1] != "active" else morceaux[2]
+    # garder seulement les unités utiles : celles qui écoutent sur un port
+    utiles = {e["unite"] for e in ecoute if e["unite"]}
+    return {"ecoute": ecoute, "unites": {u: unites.get(u, "?") for u in sorted(utiles)}, "eteint": False}
+
+
+def v_services_tous(args):
+    """Comme ``services``, pour plusieurs CT en une seule connexion SSH."""
+    from concurrent.futures import ThreadPoolExecutor
+    ids = list(dict.fromkeys(args))[:60]
+
+    def un(ctid):
+        try:
+            return ctid, v_services([ctid])
+        except Refus as e:
+            return ctid, {"erreur": str(e), "ecoute": [], "unites": {}}
+        except Exception:  # noqa: BLE001
+            return ctid, {"erreur": "lecture impossible", "ecoute": [], "unites": {}}
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        return {"cts": dict(pool.map(un, ids))}
+
+
+def v_trafic(_):
+    """Visiteurs par jour et par domaine, depuis les résumés JSON de GoAccess (un fichier par domaine)."""
+    if not CT_TRAFIC:
+        return {"domaines": {}}
+    script = r"""
+import json, glob, os, sys
+res = {}
+for f in glob.glob(os.path.join(sys.argv[1], '*.json')):
+    dom = os.path.basename(f)[:-5]
+    try:
+        d = json.loads(open(f, 'rb').read().decode('utf-8', 'replace'))
+    except Exception:
+        continue
+    jours = []
+    for x in d.get('visitors', {}).get('data', []):
+        jours.append([x.get('data'), x.get('visitors', {}).get('count', 0), x.get('hits', {}).get('count', 0), x.get('bytes', {}).get('count', 0)])
+    res[dom] = jours
+print(json.dumps(res))
+"""
+    sortie = lancer(["pct", "exec", CT_TRAFIC, "--", "python3", "-c", script, TRAFIC_RESUMES], delai=30)
+    return {"domaines": json.loads(sortie)}
+
+
+def v_caddy_lire(_):
+    return {"texte": lancer(["pct", "exec", CT_CADDY, "--", "cat", CADDYFILE], delai=20)}
+
+
+# --------------------------------------------------------------------------- actions sur les CT
+
+def v_ct(args):
+    if len(args) != 2 or args[1] not in ("start", "shutdown", "reboot"):
+        raise Refus("Usage : ct <id> start|shutdown|reboot")
+    ctid = verifier_ct(args[0])
+    if args[1] == "shutdown":
+        r = subprocess.run(["pct", "shutdown", ctid, "--timeout", "40"], capture_output=True, timeout=70)
+        if r.returncode != 0:
+            lancer(["pct", "stop", ctid], delai=40)
+    else:
+        lancer(["pct", args[1], ctid], delai=90)
+    return {"etat": pvesh("nodes", NOEUD, "lxc", ctid, "status", "current").get("status")}
+
+
+def v_service(args):
+    if len(args) != 3 or args[1] not in ("start", "stop", "restart"):
+        raise Refus("Usage : service <id> start|stop|restart <unité>")
+    ctid = verifier_ct(args[0])
+    unite = args[2]
+    if not UNITE_RE.match(unite) or UNITES_INTERDITES.match(unite):
+        raise Refus("Unité refusée.")
+    lancer(["pct", "exec", ctid, "--", "systemctl", args[1], unite], delai=60)
+    etat = subprocess.run(["pct", "exec", ctid, "--", "systemctl", "is-active", unite], capture_output=True, timeout=20)
+    return {"unite": unite, "etat": etat.stdout.decode().strip()}
+
+
+def v_snapshot(args):
+    ctid = verifier_ct(args[0] if args else "")
+    raison = re.sub(r"[^A-Za-z0-9 àâçéèêëîïôûùüÿœÀÉÈ'._-]", "", " ".join(args[1:]))[:80] or "avant modification"
+    nom = "phare_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    lancer(["pct", "snapshot", ctid, nom, "--description", f"Phare : {raison}"], delai=120)
+    # ne garder que les 3 derniers snapshots créés par Phare
+    snaps = sorted(s["name"] for s in pvesh("nodes", NOEUD, "lxc", ctid, "snapshot") if s.get("name", "").startswith("phare_"))
+    for vieux in snaps[:-3]:
+        subprocess.run(["pct", "delsnapshot", ctid, vieux], capture_output=True, timeout=120)
+    return {"snapshot": nom}
+
+
+def v_snapshots(args):
+    ctid = verifier_ct(args[0] if args else "", pilotable=False)
+    snaps = [
+        {"nom": s["name"], "date": s.get("snaptime"), "description": s.get("description", "")}
+        for s in pvesh("nodes", NOEUD, "lxc", ctid, "snapshot") if s.get("name") != "current"
+    ]
+    return {"snapshots": sorted(snaps, key=lambda s: s.get("date") or 0, reverse=True)}
+
+
+def v_restaurer_snapshot(args):
+    if len(args) != 2 or not SNAP_RE.match(args[1]):
+        raise Refus("Usage : restaurer-snapshot <id> <snapshot>")
+    ctid = verifier_ct(args[0])
+    noms = {s["name"] for s in pvesh("nodes", NOEUD, "lxc", ctid, "snapshot")}
+    if args[1] not in noms or args[1] == "current":
+        raise Refus("Snapshot inconnu.")
+    tournait = pvesh("nodes", NOEUD, "lxc", ctid, "status", "current").get("status") == "running"
+    if tournait:
+        lancer(["pct", "shutdown", ctid, "--timeout", "40", "--forceStop", "1"], delai=80)
+    lancer(["pct", "rollback", ctid, args[1]], delai=300)
+    if tournait:
+        lancer(["pct", "start", ctid], delai=90)
+    return {"restaure": args[1]}
+
+
+# --------------------------------------------------------------------------- Caddy
+
+def v_caddy_ecrire(_):
+    """Nouveau Caddyfile sur l'entrée standard : validation, sauvegarde, rechargement, retour arrière si échec."""
+    nouveau = lire_entree(2 * 1024 * 1024)
+    if b"\x00" in nouveau or not nouveau.strip():
+        raise Refus("Caddyfile vide ou illisible.")
+    tmp = f"/tmp/phare-caddy-{uuid.uuid4().hex}"
+    with open(tmp, "wb") as f:
+        f.write(nouveau)
+    try:
+        lancer(["pct", "push", CT_CADDY, tmp, "/etc/caddy/Caddyfile.phare-nouveau", "--perms", "0644"], delai=30)
+        # Validation sous l'utilisateur caddy : lancé en root, « caddy validate » crée les fichiers
+        # de journal au nom de root et le rechargement suivant échoue.
+        val = subprocess.run(
+            ["pct", "exec", CT_CADDY, "--"] + shlex.split(VALIDER_CADDY) + ["/etc/caddy/Caddyfile.phare-nouveau"],
+            capture_output=True, timeout=60)
+        if val.returncode != 0:
+            lignes = [l for l in val.stderr.decode("utf-8", "replace").splitlines() if '"error"' in l or "Error" in l]
+            raise Refus("Caddy refuse la nouvelle configuration : " + (lignes[-1][-300:] if lignes else "erreur inconnue"))
+        horo = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        script = (
+            "set -e; mkdir -p /etc/caddy/phare-sauvegardes; "
+            f"cp -p {shlex.quote(CADDYFILE)} /etc/caddy/phare-sauvegardes/Caddyfile.{horo}; "
+            f"cat /etc/caddy/Caddyfile.phare-nouveau > {shlex.quote(CADDYFILE)}; rm -f /etc/caddy/Caddyfile.phare-nouveau; "
+            "ls -1t /etc/caddy/phare-sauvegardes/Caddyfile.* | tail -n +41 | xargs -r rm -f"
+        )
+        dans_ct(CT_CADDY, script, delai=30)
+        r = subprocess.run(["pct", "exec", CT_CADDY, "--", "systemctl", "reload", "caddy"], capture_output=True, timeout=90)
+        if r.returncode != 0:
+            dans_ct(CT_CADDY, f"cp -p /etc/caddy/phare-sauvegardes/Caddyfile.{horo} {shlex.quote(CADDYFILE)}; systemctl reload caddy", delai=90)
+            raise Refus("Le rechargement de Caddy a échoué : l'ancienne configuration est remise.")
+        return {"sauvegarde": f"Caddyfile.{horo}"}
+    finally:
+        os.unlink(tmp)
+        subprocess.run(["pct", "exec", CT_CADDY, "--", "rm", "-f", "/etc/caddy/Caddyfile.phare-nouveau"], capture_output=True, timeout=20)
+
+
+def v_caddy_sauvegardes(_):
+    sortie = dans_ct(CT_CADDY, "ls -1t /etc/caddy/phare-sauvegardes/ 2>/dev/null | head -40", delai=20)
+    return {"sauvegardes": [l for l in sortie.splitlines() if re.match(r"^Caddyfile\.\d{8}-\d{6}$", l)]}
+
+
+def v_caddy_sauvegarde(args):
+    nom = args[0] if args else ""
+    if not re.match(r"^Caddyfile\.\d{8}-\d{6}$", nom):
+        raise Refus("Sauvegarde inconnue.")
+    return {"texte": lancer(["pct", "exec", CT_CADDY, "--", "cat", f"/etc/caddy/phare-sauvegardes/{nom}"], delai=20)}
+
+
+def v_page_maintenance(_):
+    html = lire_entree(512 * 1024)
+    tmp = f"/tmp/phare-maint-{uuid.uuid4().hex}"
+    with open(tmp, "wb") as f:
+        f.write(html)
+    try:
+        dans_ct(CT_CADDY, "mkdir -p /etc/caddy/maintenance", delai=20)
+        lancer(["pct", "push", CT_CADDY, tmp, "/etc/caddy/maintenance/index.html", "--perms", "0644"], delai=30)
+    finally:
+        os.unlink(tmp)
+    return {}
+
+
+# --------------------------------------------------------------------------- Pi-hole et sauvegardes
+
+def _hotes_pihole():
+    brut = lancer(["pct", "exec", CT_PIHOLE, "--", "pihole-FTL", "--config", "dns.hosts"], delai=20).strip()
+    brut = brut.strip("[] \n")
+    return [h.strip() for h in brut.split(",") if h.strip()]
+
+
+def v_pihole(args):
+    """pihole <nom> <ip> : ajoute « ip nom.<domaine local> » aux noms locaux de Pi-hole (remplace l'ancien s'il existe)."""
+    if not CT_PIHOLE:
+        raise Refus("Pi-hole n'est pas configuré (CT_PIHOLE vide dans agent.conf).")
+    if len(args) != 2 or not NOM_RE.match(args[0]) or not IP_RE.match(args[1]):
+        raise Refus(f"Usage : pihole <nom> <{RESEAU}.x>")
+    nom = f"{args[0]}.{DOMAINE_LOCAL}"
+    hotes = [h for h in _hotes_pihole() if h.split()[-1] != nom]
+    hotes.append(f"{args[1]} {nom}")
+    lancer(["pct", "exec", CT_PIHOLE, "--", "pihole-FTL", "--config", "dns.hosts", json.dumps(hotes)], delai=30)
+    return {"nom": nom}
+
+
+def v_pihole_liste(_):
+    if not CT_PIHOLE:
+        return {"hotes": []}
+    return {"hotes": _hotes_pihole()}
+
+
+def v_sauvegarde(args):
+    ctid = verifier_ct(args[0] if args else "")
+    if not JOB_SAUVEGARDE:
+        raise Refus("Aucune tâche de sauvegarde configurée (JOB_SAUVEGARDE vide dans agent.conf).")
+    job = next((j for j in pvesh("cluster", "backup") if j.get("id") == JOB_SAUVEGARDE), None)
+    if job is None:
+        raise Refus(f"Tâche de sauvegarde {JOB_SAUVEGARDE} introuvable.")
+    if job.get("all"):
+        # Tâche « tous sauf » : tout nouveau CT est déjà sauvegardé. Ne jamais la réécrire
+        # en liste fixe (elle perdrait les autres invités) : on dit seulement s'il est exclu.
+        exclus = liste(str(job.get("exclude", "")))
+        return {"sauvegarde": "tous sauf " + ",".join(exclus), "inclus": ctid not in exclus}
+    ids = liste(str(job.get("vmid", "")))
+    if ctid not in ids:
+        ids.append(ctid)
+        lancer(["pvesh", "set", f"/cluster/backup/{JOB_SAUVEGARDE}", "--vmid", ",".join(ids)], delai=30)
+    return {"sauvegarde": ids}
+
+
+# --------------------------------------------------------------------------- tâches longues (création, déploiement)
+
+def _job_nouveau():
+    os.makedirs(DOSSIER_JOBS, exist_ok=True)
+    jid = uuid.uuid4().hex[:12]
+    # nettoyer les vieux journaux (plus de 14 jours)
+    for f in os.listdir(DOSSIER_JOBS):
+        p = os.path.join(DOSSIER_JOBS, f)
+        if time.time() - os.path.getmtime(p) > 14 * 86400:
+            os.unlink(p)
+    return jid
+
+
+def _job_detacher(jid, verbe):
+    """Relance cet agent en arrière-plan (« _executer <jid> »), détaché de la session SSH."""
+    base = os.path.join(DOSSIER_JOBS, jid)
+    with open(base + ".etat", "w") as f:
+        json.dump({"etat": "en cours", "verbe": verbe, "debut": time.time()}, f)
+    env = dict(os.environ, PHARE_JOB=jid)
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "_executer", jid],
+        stdin=subprocess.DEVNULL, stdout=open(base + ".log", "a"), stderr=subprocess.STDOUT,
+        start_new_session=True, env=env, close_fds=True,
+    )
+    return {"job": jid}
+
+
+def v_creer(_):
+    """JSON sur l'entrée : {id, nom, ip, taille, type, pihole, sauvegarde}. Lance la création en arrière-plan."""
+    try:
+        d = json.loads(lire_entree(64 * 1024))
+    except ValueError:
+        raise Refus("Demande illisible.")
+    ctid, nom, ip = str(d.get("id", "")), str(d.get("nom", "")), str(d.get("ip", ""))
+    if not ID_RE.match(ctid) or ct_existe(ctid) or int(ctid) < 100:
+        raise Refus("Numéro de CT invalide ou déjà pris.")
+    if not NOM_RE.match(nom):
+        raise Refus("Nom invalide : minuscules, chiffres et tirets.")
+    m = IP_RE.match(ip)
+    if not m or not 2 <= int(m.group(1)) <= 253:
+        raise Refus(f"IP invalide : {RESEAU}.x attendu.")
+    for f in os.listdir("/etc/pve/lxc"):
+        if f.endswith(".conf") and ip_de(config_ct(f[:-5])) == ip:
+            raise Refus(f"L'IP {ip} est déjà prise par le CT {f[:-5]}.")
+    if d.get("taille") not in PRESETS or d.get("type") not in TYPES:
+        raise Refus("Taille ou type inconnu.")
+    jid = _job_nouveau()
+    with open(os.path.join(DOSSIER_JOBS, jid + ".demande"), "w") as f:
+        json.dump({"verbe": "creer", "id": ctid, "nom": nom, "ip": ip, "taille": d["taille"], "type": d["type"],
+                   "pihole": bool(d.get("pihole")), "sauvegarde": bool(d.get("sauvegarde"))}, f)
+    return _job_detacher(jid, "creer")
+
+
+def v_deployer(args):
+    """deployer <id> <type> : archive .zip ou .tar.gz sur l'entrée standard. Snapshot, puis mise en ligne."""
+    if len(args) != 2 or args[1] not in TYPES:
+        raise Refus("Usage : deployer <id> statique|node|next")
+    ctid = verifier_ct(args[0])
+    donnees = lire_entree()
+    if donnees[:2] == b"PK":
+        ext = "zip"
+    elif donnees[:2] == b"\x1f\x8b":
+        ext = "tgz"
+    else:
+        raise Refus("Archive non reconnue : envoie un .zip ou un .tar.gz.")
+    jid = _job_nouveau()
+    archive = os.path.join(DOSSIER_JOBS, f"{jid}.{ext}")
+    with open(archive, "wb") as f:
+        f.write(donnees)
+    with open(os.path.join(DOSSIER_JOBS, jid + ".demande"), "w") as f:
+        json.dump({"verbe": "deployer", "id": ctid, "type": args[1], "archive": archive}, f)
+    return _job_detacher(jid, "deployer")
+
+
+def v_job(args):
+    jid = args[0] if args else ""
+    if not JOB_RE.match(jid):
+        raise Refus("Tâche inconnue.")
+    base = os.path.join(DOSSIER_JOBS, jid)
+    try:
+        with open(base + ".etat") as f:
+            etat = json.load(f)
+    except OSError:
+        raise Refus("Tâche inconnue.")
+    try:
+        with open(base + ".log", encoding="utf-8", errors="replace") as f:
+            log = f.read()[-12000:]
+    except OSError:
+        log = ""
+    etat["journal"] = log
+    return etat
+
+
+def etape(texte):
+    print(f"> {texte}", flush=True)
+
+
+def _attendre_reseau(ctid):
+    for _ in range(40):
+        r = subprocess.run(["pct", "exec", ctid, "--", "sh", "-c", "getent hosts deb.debian.org >/dev/null"], capture_output=True, timeout=20)
+        if r.returncode == 0:
+            return
+        time.sleep(2)
+    raise Refus("Le CT n'a pas accès au réseau.")
+
+
+def _apt(ctid, paquets):
+    script = ("export DEBIAN_FRONTEND=noninteractive LC_ALL=C.UTF-8 LANG=C.UTF-8; apt-get update -qq && "
+              f"apt-get install -y -qq -o Dpkg::Progress-Fancy=0 --no-install-recommends {' '.join(paquets)} >/dev/null && "
+              f"echo '  paquets installés : {' '.join(paquets)}'")
+    r = subprocess.run(["pct", "exec", ctid, "--", "sh", "-c", script], timeout=900)
+    if r.returncode != 0:
+        raise Refus("apt-get a échoué.")
+
+
+PAGE_ATTENTE = """<!doctype html><html lang="fr"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Bientôt en ligne</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#070b14;color:#e8e2d0;font:18px system-ui}
+p{opacity:.6}</style><div><h1>Bientôt en ligne</h1><p>Le site arrive. Phare a préparé la place.</p></div></html>
+"""
+
+UNITE_NODE = """[Unit]
+Description=Site (Phare) - application Node
+After=network-online.target
+
+[Service]
+User=site
+WorkingDirectory=/opt/site
+Environment=NODE_ENV=production
+Environment=PORT=3000
+Environment=HOSTNAME=0.0.0.0
+ExecStart=/usr/bin/npm start
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def _executer_creer(d):
+    p = PRESETS[d["taille"]]
+    ctid = d["id"]
+    etape(f"Création du CT {ctid} « {d['nom']} » ({d['taille']} : {p['cores']} cœur(s), {p['memory']} Mo, {p['disk']} Go) en {d['ip']}")
+    lancer([
+        "pct", "create", ctid, GABARIT,
+        "--hostname", d["nom"], "--cores", str(p["cores"]), "--memory", str(p["memory"]), "--swap", str(p["swap"]),
+        "--rootfs", f"{STOCKAGE}:{p['disk']}", "--unprivileged", "1", "--features", "nesting=1",
+        "--net0", f"name=eth0,bridge={PONT},ip={d['ip']}/{MASQUE},gw={PASSERELLE}",
+        "--nameserver", DNS, "--searchdomain", DOMAINE_LOCAL, "--onboot", "1", "--timezone", FUSEAU,
+        "--tags", f"site;phare;{d['type']}", "--description", f"Site créé par Phare ({d['type']}, {d['taille']}).",
+    ], delai=600)
+    etape("Démarrage")
+    lancer(["pct", "start", ctid], delai=90)
+    _attendre_reseau(ctid)
+    etape("Installation des paquets (quelques minutes)")
+    if d["type"] == "statique":
+        _apt(ctid, ["nginx-light", "ca-certificates", "unzip"])
+        dans_ct(ctid, "mkdir -p /var/www/site && rm -f /etc/nginx/sites-enabled/default", delai=20)
+        conf = ("server {\n\tlisten 80 default_server;\n\tlisten [::]:80 default_server;\n\troot /var/www/site;\n"
+                "\tindex index.html;\n\tserver_tokens off;\n\tlocation / { try_files $uri $uri/ $uri.html =404; }\n}\n")
+        dans_ct(ctid, "cat > /etc/nginx/sites-available/site && ln -sf /etc/nginx/sites-available/site /etc/nginx/sites-enabled/site", entree=conf.encode())
+        dans_ct(ctid, "cat > /var/www/site/index.html", entree=PAGE_ATTENTE.encode())
+        dans_ct(ctid, "nginx -t && systemctl restart nginx && systemctl enable nginx", delai=30)
+    else:
+        # Node vient de NodeSource, posé par le modèle commun (modele-ct) ci-dessous
+        _apt(ctid, ["ca-certificates", "unzip"])
+        dans_ct(ctid, "id site >/dev/null 2>&1 || useradd -r -m -d /opt/site -s /usr/sbin/nologin site; mkdir -p /opt/site; chown site:site /opt/site", delai=20)
+        dans_ct(ctid, "cat > /etc/systemd/system/site.service && systemctl daemon-reload", entree=UNITE_NODE.encode())
+    if MODELE_CT and os.access(MODELE_CT, os.X_OK):
+        etape("Modèle commun : pare-feu, mises à jour automatiques, SSH par clé, Node, service bridé")
+        r = subprocess.run([MODELE_CT, ctid, "--type", d["type"], "--nom", d["nom"]], timeout=1200)
+        if r.returncode != 0:
+            raise Refus("Le modèle commun a échoué (voir le journal ci-dessus).")
+    else:
+        etape("Modèle commun absent (MODELE_CT) : étape sautée")
+    if d.get("pihole"):
+        if CT_PIHOLE:
+            etape(f"Nom local {d['nom']}.{DOMAINE_LOCAL} dans Pi-hole")
+            v_pihole([d["nom"], d["ip"]])
+        else:
+            etape("Pi-hole non configuré : nom local ignoré")
+    if d.get("sauvegarde"):
+        if JOB_SAUVEGARDE:
+            etape(f"Ajout à la tâche de sauvegarde {JOB_SAUVEGARDE}")
+            v_sauvegarde([ctid])
+        else:
+            etape("Aucune tâche de sauvegarde configurée : étape sautée")
+    etape("CT prêt.")
+
+
+def _executer_deployer(d):
+    ctid, typ, archive = d["id"], d["type"], d["archive"]
+    try:
+        etape("Snapshot de sécurité avant déploiement")
+        v_snapshot([ctid, "avant déploiement"])
+        etape("Envoi de l'archive dans le CT")
+        ext = archive.rsplit(".", 1)[-1]
+        lancer(["pct", "push", ctid, archive, f"/tmp/phare-site.{ext}"], delai=300)
+        cible = "/var/www/site" if typ == "statique" else "/opt/site"
+        # L'archive vient du réseau et ce script tourne en root dans le CT. Une archive avec des liens
+        # symboliques pourrait écrire ou changer des droits hors de la cible. Donc :
+        # 1) inspection AVANT extraction : refus des liens, fichiers spéciaux, chemins absolus et « .. » ;
+        # 2) extraction par « nobody » dans un dossier à lui ; 3) contrôle APRÈS extraction ;
+        # 4) node_modules et .env de la cible ne doivent pas être des liens ;
+        # 5) cp --remove-destination, chmod sans suivre les liens.
+        if ext == "zip":
+            lister = ("unzip -Z -l /tmp/phare-site.zip | awk 'NR>2 && /^[-a-z?]/{print substr($1,1,1)}' > /tmp/phare-types; "
+                      "unzip -Z1 /tmp/phare-site.zip > /tmp/phare-noms; ")
+            extraire = "runuser -u nobody -- unzip -q -o /tmp/phare-site.zip -d /tmp/phare-site"
+        else:
+            lister = ("tar tvzf /tmp/phare-site.tgz | cut -c1 > /tmp/phare-types; "
+                      "tar tzf /tmp/phare-site.tgz > /tmp/phare-noms; ")
+            extraire = ("runuser -u nobody -- tar xzf /tmp/phare-site.tgz --no-same-owner --no-same-permissions "
+                        "-C /tmp/phare-site")
+        script = (
+            "set -e; rm -rf /tmp/phare-site /tmp/phare-types /tmp/phare-noms; " + lister
+            + "if grep -q -v -E '^[-d]$' /tmp/phare-types; then echo 'Archive refusée : elle contient des liens ou des fichiers spéciaux.' >&2; exit 1; fi; "
+            + "if grep -q -E '^/|(^|/)\\.\\.(/|$)' /tmp/phare-noms; then echo 'Archive refusée : chemin absolu ou .. dans un nom.' >&2; exit 1; fi; "
+            + f"chmod 644 /tmp/phare-site.{ext}; install -d -o nobody -m 700 /tmp/phare-site; " + extraire + "; "
+            + "if [ -n \"$(find /tmp/phare-site ! -type f ! -type d | head -1)\" ]; then echo 'Archive refusée : lien ou fichier spécial après extraction.' >&2; exit 1; fi; "
+            + "chown -R root:root /tmp/phare-site; cd /tmp/phare-site; "
+            # si l'archive contient un seul dossier, on prend son contenu
+            + 'n=$(ls -A | wc -l); if [ "$n" = 1 ] && [ -d "$(ls -A)" ]; then src="/tmp/phare-site/$(ls -A)"; else src=/tmp/phare-site; fi; '
+            + f"mkdir -p {cible}; "
+            + f"for g in {cible}/node_modules {cible}/.env; do if [ -L \"$g\" ]; then rm -f \"$g\"; echo \"$g était un lien symbolique : retiré, déploiement arrêté.\" >&2; exit 1; fi; done; "
+            + f"find {cible} -mindepth 1 -maxdepth 1 ! -name node_modules ! -name .env -exec rm -rf {{}} +; "
+            + f'cp -a --remove-destination "$src"/. {cible}/; rm -rf /tmp/phare-site /tmp/phare-site.{ext} /tmp/phare-types /tmp/phare-noms; '
+            # les zip faits sous Windows arrivent en 777/666 : droits normaux, personne d'autre n'écrit (jamais à travers un lien)
+            + f"find {cible} -path {cible}/node_modules -prune -o ! -type l -exec chmod u=rwX,go=rX {{}} +"
+        )
+        etape(f"Mise en place des fichiers dans {cible}")
+        dans_ct(ctid, script, delai=300)
+        if typ == "statique":
+            dans_ct(ctid, "chown -R www-data:www-data /var/www/site; systemctl reload nginx", delai=30)
+        else:
+            dans_ct(ctid, "test -f /opt/site/package.json || { echo 'package.json absent de l archive' >&2; exit 1; }", delai=20)
+            etape("Installation des dépendances (npm)")
+            r = subprocess.run(["pct", "exec", ctid, "--", "sh", "-c",
+                                "cd /opt/site && chown -R site:site /opt/site && "
+                                "runuser -u site -- sh -c 'if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi'"],
+                               timeout=1800)
+            if r.returncode != 0:
+                raise Refus("npm install a échoué.")
+            if typ == "next" or '"build"' in dans_ct(ctid, "cat /opt/site/package.json", delai=10):
+                etape("Construction (npm run build)")
+                r = subprocess.run(["pct", "exec", ctid, "--", "sh", "-c", "cd /opt/site && runuser -u site -- npm run build"], timeout=1800)
+                if r.returncode != 0:
+                    raise Refus("npm run build a échoué.")
+            etape("Redémarrage du service site.service")
+            dans_ct(ctid, "systemctl enable site.service >/dev/null 2>&1; systemctl restart site.service; sleep 3; systemctl is-active site.service", delai=60)
+        etape("Déployé.")
+    finally:
+        try:
+            os.unlink(archive)
+        except OSError:
+            pass
+
+
+def executer(jid):
+    base = os.path.join(DOSSIER_JOBS, jid)
+    with open(base + ".demande") as f:
+        d = json.load(f)
+    with open(base + ".etat") as f:
+        etat = json.load(f)
+    try:
+        if d["verbe"] == "creer":
+            _executer_creer(d)
+        elif d["verbe"] == "deployer":
+            _executer_deployer(d)
+        etat.update(etat="fini", fin=time.time())
+    except Exception as e:  # noqa: BLE001 (la tâche doit toujours finir avec un état)
+        print(f"ERREUR : {e}", flush=True)
+        etat.update(etat="échec", fin=time.time(), erreur=str(e)[:400])
+    with open(base + ".etat", "w") as f:
+        json.dump(etat, f)
+    journal(f"job {jid} {d['verbe']} {d.get('id')} : {etat['etat']}")
+
+
+# --------------------------------------------------------------------------- aiguillage
+
+VERBES = {
+    "etat": v_etat, "services": v_services, "services-tous": v_services_tous, "trafic": v_trafic,
+    "caddy-lire": v_caddy_lire, "caddy-ecrire": v_caddy_ecrire,
+    "caddy-sauvegardes": v_caddy_sauvegardes, "caddy-sauvegarde": v_caddy_sauvegarde,
+    "page-maintenance": v_page_maintenance,
+    "ct": v_ct, "service": v_service,
+    "snapshot": v_snapshot, "snapshots": v_snapshots, "restaurer-snapshot": v_restaurer_snapshot,
+    "pihole": v_pihole, "pihole-liste": v_pihole_liste, "sauvegarde": v_sauvegarde,
+    "creer": v_creer, "deployer": v_deployer, "job": v_job,
+}
+
+
+def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "_executer" and JOB_RE.match(sys.argv[2]) and os.environ.get("PHARE_JOB") == sys.argv[2]:
+        executer(sys.argv[2])
+        return 0
+    cmd = os.environ.get("SSH_ORIGINAL_COMMAND", " ".join(sys.argv[1:])).strip()
+    morceaux = cmd.split()
+    if not morceaux or morceaux[0] not in VERBES or len(cmd) > 300:
+        print(json.dumps({"ok": False, "erreur": "Verbe inconnu."}))
+        return 1
+    journal(cmd)
+    try:
+        res = VERBES[morceaux[0]](morceaux[1:])
+        print(json.dumps({"ok": True, **(res or {})}, ensure_ascii=False))
+        return 0
+    except Refus as e:
+        journal(f"  refus : {e}")
+        print(json.dumps({"ok": False, "erreur": str(e)}, ensure_ascii=False))
+        return 1
+    except subprocess.TimeoutExpired:
+        print(json.dumps({"ok": False, "erreur": "Délai dépassé."}))
+        return 1
+    except Exception as e:  # noqa: BLE001
+        journal(f"  erreur : {e!r}")
+        print(json.dumps({"ok": False, "erreur": "Erreur interne de l'agent (voir /var/log/phare-agent.log)."}))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

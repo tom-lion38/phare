@@ -1,0 +1,260 @@
+#!/bin/bash
+# modele-ct : modèle commun d'un conteneur de site, rejouable.
+# Lancé en root sur l'hôte Proxmox. Deux passages donnent le même résultat (rien n'est réécrit s'il n'a pas changé).
+#
+#   modele-ct <id> --type statique|node|next [--port 80|3000] [--profil tout|securite] [--samba] [--nom <nom>]
+#             [--role "<rôle>"] [--essai]
+#
+# Applique dans le CT :
+#   - fuseau horaire ; paquets de base (nftables, unattended-upgrades, needrestart, curl) ; Postfix retiré ;
+#   - mises à jour automatiques (profil « tout » = Debian courantes + sécurité, ou « securite ») ;
+#     needrestart relance seul les services touchés ;
+#   - SSH par clé seulement ;
+#   - pare-feu : entrée = port du site depuis Caddy (et les postes d'admin), SSH depuis les réseaux privés ;
+#     sortie = Internet, jamais les réseaux privés (sauf DNS, DHCP et les services de supervision réglés) ;
+#   - types node et next : Node 24 par NodeSource (clé contrôlée contre son empreinte), unité site.service bridée ;
+#   - description Proxmox « Rôle | Domaine | Port » si elle est vide ou générique.
+# Ne crée aucun bloc Caddy. Ne touche jamais aux CT de CT_PROTEGES.
+#
+# Réglages lus dans /etc/phare/agent.conf (voir deploy/agent.conf.exemple) :
+#   CT_PROTEGES, CADDY_IP, ADMIN_IPS, DNS_IPS, PASSERELLE, FUSEAU, DOMAINE_LOCAL, INFLUX, LOKI, JOURNAUX_ENVOI
+set -euo pipefail
+
+CONF=${PHARE_AGENT_CONF:-/etc/phare/agent.conf}
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+CT_PROTEGES=${CT_PROTEGES:-}
+CADDY_IP=${CADDY_IP:-}
+ADMIN_IPS=${ADMIN_IPS:-}
+PASSERELLE=${PASSERELLE:-}
+DNS_IPS=${DNS_IPS:-${PASSERELLE}}
+FUSEAU=${FUSEAU:-Europe/Paris}
+DOMAINE_LOCAL=${DOMAINE_LOCAL:-lan}
+INFLUX=${INFLUX:-}            # ip:port d'InfluxDB, si Telegraf tourne dans les CT
+LOKI=${LOKI:-}                # ip:port d'un collecteur de journaux (syslog TCP), facultatif
+JOURNAUX_ENVOI=${JOURNAUX_ENVOI:-}   # script qui branche les journaux du CT, facultatif
+
+CT=${1:-}; shift || true
+TYPE=""; PORT=""; PROFIL=tout; SAMBA=""; NOM=""; ROLE=""; ESSAI=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --type) TYPE=$2; shift 2;; --port) PORT=$2; shift 2;; --profil) PROFIL=$2; shift 2;;
+    --samba) SAMBA=1; shift;; --nom) NOM=$2; shift 2;; --role) ROLE=$2; shift 2;; --essai) ESSAI=1; shift;;
+    *) echo "option inconnue : $1" >&2; exit 2;;
+  esac
+done
+[[ "$CT" =~ ^[1-9][0-9]{2,8}$ ]] || { echo "usage : modele-ct <id> --type statique|node|next [...]" >&2; exit 2; }
+case ",$(echo "$CT_PROTEGES" | tr ' ' ','),," in *",$CT,"*) echo "CT $CT exclu du modèle (CT_PROTEGES)" >&2; exit 3;; esac
+case "$TYPE" in statique) PORT=${PORT:-80};; node|next) PORT=${PORT:-3000};; *) echo "--type statique|node|next obligatoire" >&2; exit 2;; esac
+case "$PROFIL" in tout|securite) ;; *) echo "--profil tout|securite" >&2; exit 2;; esac
+[ -n "$CADDY_IP" ] || { echo "CADDY_IP manquant dans $CONF" >&2; exit 2; }
+[ -n "$DNS_IPS" ] || { echo "DNS_IPS (ou PASSERELLE) manquant dans $CONF" >&2; exit 2; }
+[ "$(pct status "$CT" | awk '{print $2}')" = running ] || { echo "CT $CT arrêté" >&2; exit 1; }
+NOM=${NOM:-$(pct config "$CT" | awk '/^hostname:/{print $2}')}
+# Empreinte publique de la clé de signature du dépôt NodeSource
+NODESOURCE_FPR=6F71F525282841EEDAF851B42F59B5F99B1BE0B4
+change=0
+dans() { pct exec "$CT" -- bash -c "$1"; }
+etape() { echo "> $*"; }
+# « a,b c » donne « a, b, c » (éléments d'un ensemble nftables)
+elements() { echo "$*" | tr ' ,' '\n\n' | grep -v '^$' | paste -sd, - | sed 's/,/, /g'; }
+
+# Écrit un fichier dans le CT seulement s'il a changé ; renvoie 0 si écrit.
+poser() {  # poser <chemin> <droits> (contenu sur l'entrée standard)
+  local tmp; tmp=$(mktemp); cat > "$tmp"
+  local avant; avant=$(pct exec "$CT" -- sh -c "cat '$1' 2>/dev/null | md5sum" | cut -d' ' -f1)
+  if [ "$avant" = "$(md5sum < "$tmp" | cut -d' ' -f1)" ]; then rm -f "$tmp"; return 1; fi
+  if [ "$ESSAI" = 1 ]; then echo "  (essai) $1 serait écrit"; rm -f "$tmp"; return 1; fi
+  # La copie de l'ancien fichier part dans /root/modele-ct-avant/ et jamais à côté : APT lit
+  # tous les fichiers de apt.conf.d, et une copie laissée là serait lue après l'original.
+  pct exec "$CT" -- sh -c "mkdir -p \"\$(dirname '$1')\" \"\$(dirname '/root/modele-ct-avant$1')\"; [ -f '$1' ] && cp -p '$1' '/root/modele-ct-avant$1' 2>/dev/null; true"
+  pct push "$CT" "$tmp" "$1" --perms "$2"; rm -f "$tmp"; change=1; echo "  écrit : $1"; return 0
+}
+
+etape "CT $CT ($NOM) : type $TYPE, port $PORT, profil $PROFIL$( [ -n "$SAMBA" ] && echo ', Samba')"
+dans '. /etc/os-release; [ "$VERSION_CODENAME" = trixie ] || echo "  attention : Debian $VERSION_CODENAME (le modèle vise Debian 13)"'
+
+etape "Fuseau horaire $FUSEAU"
+dans "[ \"\$(readlink /etc/localtime)\" = /usr/share/zoneinfo/$FUSEAU ] || { ln -sf /usr/share/zoneinfo/$FUSEAU /etc/localtime; echo $FUSEAU > /etc/timezone; echo '  fuseau posé'; }"
+
+etape "Paquets de base"
+[ "$ESSAI" = 1 ] || dans 'export DEBIAN_FRONTEND=noninteractive LC_ALL=C.UTF-8
+manque=""; for p in nftables unattended-upgrades needrestart curl ca-certificates gpg; do dpkg -s $p >/dev/null 2>&1 || manque="$manque $p"; done
+if [ -n "$manque" ]; then apt-get update -qq && apt-get install -y -qq --no-install-recommends $manque >/dev/null && echo "  installés :$manque"; fi
+if dpkg -s postfix >/dev/null 2>&1; then apt-get purge -y -qq postfix >/dev/null && echo "  Postfix retiré"; fi'
+
+etape "Mises à jour automatiques (profil $PROFIL)"
+poser /etc/apt/apt.conf.d/20auto-upgrades 644 <<'EOF' || true
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+if [ "$PROFIL" = tout ]; then
+poser /etc/apt/apt.conf.d/52modele-tout 644 <<'EOF' || true
+// Profil « tout » (modele-ct) : mises à jour Debian courantes en plus de la sécurité
+Unattended-Upgrade::Origins-Pattern {
+        "origin=Debian,codename=${distro_codename}-updates";
+};
+EOF
+fi
+if [ "$TYPE" != statique ]; then
+poser /etc/apt/apt.conf.d/53modele-nodesource 644 <<'EOF' || true
+// Node de NodeSource mis à jour automatiquement dans sa branche (modele-ct)
+Unattended-Upgrade::Origins-Pattern {
+        "site=deb.nodesource.com";
+};
+EOF
+fi
+poser /etc/needrestart/conf.d/50-modele.conf 644 <<'EOF' || true
+# modele-ct : services relancés automatiquement après une mise à jour.
+$nrconf{restart} = 'a';
+EOF
+
+etape "SSH par clé seulement"
+if poser /etc/ssh/sshd_config.d/50-modele.conf 644 <<'EOF'
+# modele-ct : connexion par clé seulement (pct exec reste possible depuis l'hôte).
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin prohibit-password
+EOF
+then dans 'sshd -t && systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true'; fi
+
+if [ "$TYPE" != statique ]; then
+  etape "Node 24 par NodeSource"
+  [ "$ESSAI" = 1 ] || dans "set -e; export DEBIAN_FRONTEND=noninteractive LC_ALL=C.UTF-8
+if [ ! -f /etc/apt/sources.list.d/nodesource.list ]; then
+  k=\$(mktemp); curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key -o \$k
+  f=\$(gpg --show-keys --with-colons \$k | awk -F: '\$1 == \"fpr\" { print \$10; exit }')
+  [ \"\$f\" = $NODESOURCE_FPR ] || { echo \"ERREUR : empreinte NodeSource inattendue (\$f)\" >&2; exit 1; }
+  install -d -m 755 /etc/apt/keyrings; gpg --dearmor < \$k > /etc/apt/keyrings/nodesource.gpg; rm -f \$k
+  echo 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_24.x nodistro main' > /etc/apt/sources.list.d/nodesource.list
+  apt-get update -qq; echo '  dépôt NodeSource posé (empreinte contrôlée)'
+fi
+case \"\$(node -v 2>/dev/null)\" in v24.*) ;; *)
+  dpkg -s npm >/dev/null 2>&1 && apt-get purge -y -qq npm >/dev/null
+  apt-get install -y -qq nodejs >/dev/null; echo \"  Node \$(node -v)\";; esac"
+  etape "Unité site.service bridée"
+  poser /etc/systemd/system/site.service.d/50-durcissement.conf 644 <<'EOF' && dans 'systemctl daemon-reload' || true
+# modele-ct : l'application n'écrit que dans /opt/site et ne gagne aucun droit.
+[Service]
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/site
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+PrivateDevices=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectProc=invisible
+ProcSubset=pid
+RemoveIPC=yes
+UMask=0027
+EOF
+fi
+
+etape "Pare-feu (entrée : port $PORT depuis Caddy ; sortie : jamais le réseau local)"
+TELE=$(dans 'systemctl is-active telegraf 2>/dev/null || true')
+AMONT=$(elements "$CADDY_IP $ADMIN_IPS")
+DNS_NFT=$(elements "$DNS_IPS")
+{
+cat <<EOF
+#!/usr/sbin/nft -f
+# Pare-feu de site posé par modele-ct.
+# Entrée : port du site depuis Caddy (et les postes d'admin), SSH depuis les réseaux privés.
+# Sortie : Internet, jamais les réseaux privés (sauf DNS, DHCP et la supervision).
+flush ruleset
+
+table inet site {
+	set amont {
+		type ipv4_addr
+		elements = { $AMONT }
+	}
+
+	set prive {
+		type ipv4_addr
+		flags interval
+		elements = { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 }
+	}
+
+	chain entree {
+		type filter hook input priority filter; policy drop;
+		iif "lo" accept
+		ct state established,related accept
+		ct state invalid drop
+		meta l4proto { icmp, ipv6-icmp } accept
+		udp dport 68 accept comment "renouvellement DHCP"
+		ip saddr @amont tcp dport $PORT accept comment "Caddy vers le site"
+		ip saddr @prive tcp dport 22 accept comment "SSH depuis le réseau local et le VPN"
+EOF
+[ -n "$SAMBA" ] && echo '		ip saddr @prive tcp dport { 139, 445 } accept comment "Samba du site depuis le réseau local et le VPN"'
+cat <<EOF
+		counter comment "entrées refusées"
+	}
+
+	chain sortie {
+		type filter hook output priority filter; policy accept;
+		oif "lo" accept
+		ct state established,related accept
+		ip daddr 255.255.255.255 udp dport 67 accept comment "DHCP (diffusion)"
+		ip daddr { $DNS_NFT } meta l4proto { tcp, udp } th dport 53 accept comment "DNS"
+EOF
+[ -n "$PASSERELLE" ] && echo "		ip daddr $PASSERELLE udp dport 67 accept comment \"DHCP du routeur\""
+[ "$TELE" = active ] && [ -n "$INFLUX" ] && echo "		ip daddr ${INFLUX%:*} tcp dport ${INFLUX##*:} accept comment \"métriques (Telegraf vers InfluxDB)\""
+[ -n "$LOKI" ] && echo "		ip daddr ${LOKI%:*} tcp dport ${LOKI##*:} accept comment \"journaux (syslog TCP)\""
+cat <<EOF
+		ip daddr @prive counter reject with icmpx admin-prohibited comment "jamais le réseau local"
+		icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept comment "voisinage IPv6"
+		ip6 daddr { fc00::/7, fe80::/10 } counter reject comment "jamais le réseau local en IPv6"
+	}
+
+	chain transit {
+		type filter hook forward priority filter; policy drop;
+	}
+}
+EOF
+} > /tmp/modele-nft-$CT.conf
+if poser /etc/nftables.conf 755 < /tmp/modele-nft-$CT.conf; then
+  if ! dans 'nft -c -f /etc/nftables.conf'; then
+    dans '[ -f /root/modele-ct-avant/etc/nftables.conf ] && cp -p /root/modele-ct-avant/etc/nftables.conf /etc/nftables.conf || rm -f /etc/nftables.conf'
+    echo "ERREUR : pare-feu refusé par nft, ancien fichier remis" >&2; rm -f /tmp/modele-nft-$CT.conf; exit 1
+  fi
+  dans 'nft -f /etc/nftables.conf && systemctl enable nftables >/dev/null 2>&1'
+  if ! dans 'getent hosts deb.debian.org >/dev/null && timeout 8 bash -c "</dev/tcp/deb.debian.org/443"'; then
+    dans '[ -f /root/modele-ct-avant/etc/nftables.conf ] && { cp -p /root/modele-ct-avant/etc/nftables.conf /etc/nftables.conf; nft -f /etc/nftables.conf; } || nft flush ruleset'
+    echo "ERREUR : plus de DNS ou d'Internet après le pare-feu : retour arrière fait" >&2; rm -f /tmp/modele-nft-$CT.conf; exit 1
+  fi
+fi
+rm -f /tmp/modele-nft-$CT.conf
+
+if [ -n "$JOURNAUX_ENVOI" ]; then
+  etape "Journaux centralisés"
+  if [ "$ESSAI" = 1 ]; then echo "  (essai) $JOURNAUX_ENVOI $CT serait lancé"
+  elif [ -x "$JOURNAUX_ENVOI" ]; then
+    "$JOURNAUX_ENVOI" "$CT" | sed 's/^/  /' || echo "  attention : envoi des journaux non vérifié ($JOURNAUX_ENVOI $CT à relancer)"
+  fi
+fi
+
+etape "Description Proxmox"
+DESC=$(pct config "$CT" | sed -n 's/^description: //p' | python3 -c 'import sys,urllib.parse;print(urllib.parse.unquote(sys.stdin.read().strip()))')
+if [ -z "$DESC" ] || [[ "$DESC" == "Site créé par Phare"* ]]; then
+  NOUVELLE="Rôle: ${ROLE:-site $TYPE} | Domaine: $NOM.$DOMAINE_LOCAL | Port: $PORT ; modèle commun du $(date +%d/%m/%Y)"
+  if [ "$ESSAI" = 1 ]; then echo "  (essai) description : $NOUVELLE"; else pct set "$CT" --description "$NOUVELLE"; change=1; echo "  description posée"; fi
+fi
+
+etape "Contrôles"
+dans 'echo "  fuseau $(readlink /etc/localtime | sed s#/usr/share/zoneinfo/##) ; nft $(nft list ruleset | grep -c "policy drop") chaîne(s) en refus ; unattended $(unattended-upgrade --dry-run >/dev/null 2>&1 && echo ok || echo ÉCHEC) ; postfix $(dpkg -s postfix >/dev/null 2>&1 && echo présent || echo absent) ; node $(node -v 2>/dev/null || echo -)"'
+[ "$TYPE" = statique ] || dans 'systemctl cat site.service >/dev/null 2>&1 && echo "  site.service : exposition $(systemd-analyze security site.service 2>/dev/null | tail -1 | awk "{print \$(NF-2), \$(NF-1)}")" || echo "  site.service pas encore créé (le durcissement s appliquera à sa création)"'
+echo "> Fini ($( [ $change = 1 ] && echo 'modifications faites' || echo 'rien à changer, déjà conforme'))"

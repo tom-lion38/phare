@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phare - sites du homelab</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M13 8h6l2 20H11z' fill='%23f2b544'/%3E%3Ccircle cx='16' cy='6' r='3' fill='%23ffe7a8'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,500;9..144,700&family=Hanken+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div class="faisceau" aria-hidden="true"></div>
+<div class="grain" aria-hidden="true"></div>
+
+<aside class="rail">
+  <div class="marque">
+    <svg viewBox="0 0 40 48" class="marque-phare" aria-hidden="true">
+      <path d="M15 14h10l4 32H11z" class="tour"/>
+      <path d="M15 22h10M14 30h12M13 38h14" class="bandes"/>
+      <rect x="13" y="8" width="14" height="6" rx="1" class="lanterne"/>
+      <path d="M20 2l-6 6h12z" class="toit"/>
+    </svg>
+    <div><b>Phare</b><small>sites du homelab</small></div>
+  </div>
+  <nav>
+    <button data-vue="sites" class="actif"><i>◉</i><span>Sites</span></button>
+    <button data-vue="caddy"><i>◇</i><span>Caddy</span></button>
+    <button data-vue="nouveau"><i>＋</i><span>Nouveau site</span></button>
+    <button data-vue="cts"><i>▤</i><span>Conteneurs</span></button>
+    <button data-vue="journal"><i>≡</i><span>Journal</span></button>
+  </nav>
+  <div class="rail-pied">
+    <button id="btn-actualiser" class="fantome" title="Tout relire maintenant">Actualiser</button>
+    <span id="fraicheur">-</span>
+  </div>
+</aside>
+
+<main>
+  <header class="tete">
+    <div class="tete-titre">
+      <p class="sur-titre" id="sur-titre"></p>
+      <h1 id="titre">Sites</h1>
+    </div>
+    <div class="jauges" id="jauges"></div>
+  </header>
+  <div id="alertes"></div>
+
+  <!-- ============ SITES ============ -->
+  <section class="vue" id="vue-sites">
+    <div class="bandeau" id="bandeau"></div>
+    <div class="filtres" id="filtres">
+      <button data-f="site" class="actif">Sites</button>
+      <button data-f="appli">Applis</button>
+      <button data-f="infra">Infra</button>
+      <button data-f="tous">Tout</button>
+      <input type="search" id="recherche" placeholder="Filtrer…" aria-label="Filtrer les sites">
+    </div>
+    <div class="grille" id="grille"></div>
+    <h3 class="sous-titre" id="titre-libres" hidden>CT de sites sans domaine</h3>
+    <div class="grille petite" id="libres"></div>
+  </section>
+
+  <!-- ============ CADDY ============ -->
+  <section class="vue" id="vue-caddy" hidden>
+    <div class="barre-outils">
+      <p class="aide">Chaque domaine public arrive sur Caddy<span id="ct-caddy"></span>, qui l'envoie vers un CT. Toute modification est validée par Caddy, sauvegardée, puis appliquée sans coupure.</p>
+      <button class="primaire" id="btn-ajout-domaine">＋ Ajouter un domaine</button>
+    </div>
+    <table class="tableau" id="table-caddy">
+      <thead><tr><th>Domaine</th><th>Destination</th><th>État</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <details class="historique" id="historique-caddy">
+      <summary>Historique du Caddyfile (sauvegardes avant chaque changement)</summary>
+      <ul id="liste-sauvegardes"><li class="vide">Ouvre pour charger…</li></ul>
+    </details>
+  </section>
+
+  <!-- ============ NOUVEAU ============ -->
+  <section class="vue" id="vue-nouveau" hidden>
+    <form id="form-nouveau" class="assistant" autocomplete="off">
+      <fieldset class="etape">
+        <legend><span>1</span>Le site</legend>
+        <div class="champs deux">
+          <label>Nom du CT<input name="nom" required pattern="[a-z0-9]([a-z0-9\-]*[a-z0-9])?" maxlength="42" placeholder="mon-site"><small>minuscules, chiffres, tirets</small></label>
+          <label>Domaine public (facultatif)<input name="domaine" placeholder="monsite.exemple.fr" class="exemple-domaine"><small id="aide-dns">Caddy l'ajoute tout seul</small></label>
+        </div>
+      </fieldset>
+      <fieldset class="etape">
+        <legend><span>2</span>Taille</legend>
+        <div class="choix" id="choix-taille"></div>
+      </fieldset>
+      <fieldset class="etape">
+        <legend><span>3</span>Type</legend>
+        <div class="choix" id="choix-type">
+          <label class="carte-choix"><input type="radio" name="type" value="statique" checked><b>Statique</b><span>HTML / CSS / JS servi par nginx · port 80</span><em>vitrine, maquette, landing</em></label>
+          <label class="carte-choix"><input type="radio" name="type" value="node"><b>Node</b><span>npm start · port 3000 · service site.service</span><em>Express, API, mini-serveur</em></label>
+          <label class="carte-choix"><input type="radio" name="type" value="next"><b>Next.js</b><span>npm run build puis npm start · port 3000</span><em>sites Next, boutiques</em></label>
+        </div>
+      </fieldset>
+      <fieldset class="etape">
+        <legend><span>4</span>Réseau et options</legend>
+        <div class="champs trois">
+          <label>Numéro de CT<input name="id" inputmode="numeric" pattern="\d{3,9}"></label>
+          <label>IP (bloc des sites)<input name="ip" pattern="\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}"></label>
+          <label class="case"><input type="checkbox" name="pihole" checked><span>Nom <b id="apercu-lan">…</b>.lan dans Pi-hole</span></label>
+          <label class="case"><input type="checkbox" name="sauvegarde" checked><span>Ajouter à la tâche de sauvegarde</span></label>
+        </div>
+      </fieldset>
+      <fieldset class="etape">
+        <legend><span>5</span>Fichiers du site (facultatif)</legend>
+        <label class="depot" id="depot-nouveau">
+          <input type="file" accept=".zip,.tar.gz,.tgz" hidden>
+          <b>Glisse un .zip ici</b><span>ou clique pour choisir · déployé dès que le CT est prêt</span>
+        </label>
+      </fieldset>
+      <div class="recap" id="recap-nouveau"></div>
+      <button class="primaire grand" type="submit">Allumer le phare : créer le site</button>
+    </form>
+  </section>
+
+  <!-- ============ CONTENEURS ============ -->
+  <section class="vue" id="vue-cts" hidden>
+    <table class="tableau" id="table-cts">
+      <thead><tr><th>CT</th><th>Nom</th><th>IP</th><th>CPU</th><th>Mémoire</th><th>Sauvegarde</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <!-- ============ JOURNAL ============ -->
+  <section class="vue" id="vue-journal" hidden>
+    <ol class="journal" id="journal"></ol>
+  </section>
+</main>
+
+<div class="voile" id="voile" hidden></div>
+<aside class="tiroir" id="tiroir" hidden aria-modal="true" role="dialog">
+  <button class="fermer" id="tiroir-fermer" aria-label="Fermer">×</button>
+  <div id="tiroir-contenu"></div>
+</aside>
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

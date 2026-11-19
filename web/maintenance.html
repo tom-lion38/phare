@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Pause de maintenance</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    display: grid; place-items: center; overflow: hidden; text-align: center; padding: 24px;
+    background: radial-gradient(900px 600px at 50% 120%, #10233d 0%, transparent 70%), #060a12;
+    color: #e9e3d3; font: 17px/1.6 Georgia, "Times New Roman", serif;
+  }
+  .faisceau {
+    position: fixed; left: 50%; top: 38%; width: 220vmax; height: 220vmax; margin: -110vmax 0 0 -110vmax; pointer-events: none;
+    background: conic-gradient(from 0deg, transparent 0deg, rgba(255, 214, 140, .10) 10deg, rgba(255, 226, 170, .16) 14deg, transparent 26deg, transparent 180deg, rgba(255, 214, 140, .07) 190deg, transparent 204deg);
+    animation: tourne 12s linear infinite;
+  }
+  @keyframes tourne { to { transform: rotate(360deg); } }
+  .vagues { position: fixed; left: 0; right: 0; bottom: 0; height: 22vh; opacity: .5;
+    background: repeating-linear-gradient(170deg, transparent 0 14px, rgba(127, 209, 199, .05) 14px 15px); }
+  main { position: relative; max-width: 520px; }
+  svg { width: 64px; height: 80px; margin-bottom: 18px; }
+  .lanterne { fill: #f2b544; filter: drop-shadow(0 0 10px #f2b544); animation: lampe 3s ease-in-out infinite; }
+  @keyframes lampe { 50% { fill: #ffe1a0; } }
+  h1 { font-weight: 400; font-size: clamp(30px, 6vw, 46px); line-height: 1.1; margin: 0 0 14px; letter-spacing: -.02em; }
+  h1 em { color: #f2b544; }
+  p { color: #9aa6bb; margin: 0 auto; max-width: 420px; font-family: system-ui, sans-serif; font-size: 16px; }
+  small { display: block; margin-top: 28px; color: #5e6b82; font: 12px ui-monospace, monospace; letter-spacing: .08em; text-transform: uppercase; }
+  @media (prefers-reduced-motion: reduce) { .faisceau, .lanterne { animation: none; } }
+</style>
+</head>
+<body>
+<div class="faisceau" aria-hidden="true"></div>
+<div class="vagues" aria-hidden="true"></div>
+<main>
+  <svg viewBox="0 0 40 48" aria-hidden="true">
+    <path d="M15 14h10l4 32H11z" fill="#e9e3d3"/>
+    <path d="M15 22h10M14 30h12M13 38h14" stroke="#ff6b5b" stroke-width="3"/>
+    <rect x="13" y="8" width="14" height="6" rx="1" class="lanterne"/>
+    <path d="M20 2l-6 6h12z" fill="#c9c1ad"/>
+  </svg>
+  <h1>Le site fait une <em>pause</em>.</h1>
+  <p>Il est en maintenance pour un petit moment. Revenez un peu plus tard : la lumière se rallume bientôt.</p>
+  <small>Maintenance en cours</small>
+</main>
+</body>
+</html>
